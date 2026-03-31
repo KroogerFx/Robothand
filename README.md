@@ -1,212 +1,226 @@
-# Robot Hand - Dual Motor Control System
+# Robot Hand
 
-OOP-style project for controlling 2 N20 motors with DRV8833 drivers on 2 separate ESP32 microcontrollers.
+Dual-ESP32 PlatformIO project for an 8-motor tendon-driven robot hand.
 
-## Project Overview
+The system is split across two ESP32 boards:
+- Primary ESP32: USB serial command interface, controls motors 1-4, coordinates the full hand
+- Secondary ESP32: receives UART commands from the primary, controls motors 5-8, reports encoder feedback
 
-This system uses a **Primary-Secondary architecture**:
-- **Primary ESP32**: Receives USB serial commands, controls its motors, communicates with Secondary
-- **Secondary ESP32**: Receives commands from Primary via UART, controls its motors, sends encoder feedback
+Each board drives 4 N20 gearmotors with quadrature encoders through 2 DRV8833 drivers.
 
-## Hardware Setup
+## Current Status
 
-### Per ESP32 Board:
-- **2× N20 Motors** with quadrature encoders
-- **1× DRV8833 Dual Motor Driver**
-- **Encoder connections** (quadrature feedback)
+The project now supports:
+- 8 motors total
+- encoder-based position moves
+- direct jog commands
+- encoder direction calibration
+- stall safety in the shared motor layer
+- a staged calibration routine `c2` that currently runs motors in this order:
+  - 2, 1
+  - 6, 5
+  - 4, 3
+  - 8, 7
 
-### Pin Configuration
+## Project Layout
 
-#### Motor 1 (Driver)
-- PWM A: GPIO 12
-- PWM B: GPIO 13
-- Encoder A: GPIO 34
-- Encoder B: GPIO 35
+```text
+Robot Hand/
+├── platformio.ini
+├── src/
+│   ├── primary/
+│   │   └── main.cpp
+│   └── secondary/
+│       └── main.cpp
+├── lib/
+│   ├── Communication/
+│   ├── DRV8833/
+│   ├── Encoder/
+│   └── Motor/
+├── include/
+└── test/
+```
 
-#### Motor 2 (Driver)
-- PWM A: GPIO 14
-- PWM B: GPIO 15
+## Hardware Summary
+
+System mapping:
+- Motors 1-4 live on the primary ESP32
+- Motors 5-8 live on the secondary ESP32
+
+Per board:
+- 4 N20 motors with quadrature encoders
+- 2 DRV8833 dual H-bridge drivers
+
+## Pinout
+
+The primary and secondary use the same local motor pin layout. On the secondary, those local motors map to system motors 5-8.
+
+### Local Motor 1
+- PWM A: GPIO 22
+- PWM B: GPIO 21
 - Encoder A: GPIO 36
 - Encoder B: GPIO 39
 
-#### UART Communication (Primary ↔ Secondary)
-- RX: GPIO 16 (Serial1 RX)
-- TX: GPIO 17 (Serial1 TX)
-- Baud: 115200
+### Local Motor 2
+- PWM A: GPIO 19
+- PWM B: GPIO 18
+- Encoder A: GPIO 16
+- Encoder B: GPIO 17
 
-## Project Structure
+### Local Motor 3
+- PWM A: GPIO 25
+- PWM B: GPIO 26
+- Encoder A: GPIO 34
+- Encoder B: GPIO 35
 
-```
-Robot Hand/
-├── platformio.ini          # Configuration with primary/secondary environments
-├── README.md              # This file
-├── src/
-│   ├── primary/
-│   │   └── main.cpp      # Primary ESP32 firmware
-│   └── secondary/
-│       └── main.cpp      # Secondary ESP32 firmware
-└── lib/
-    ├── DRV8833/
-    │   ├── DRV8833.h
-    │   └── DRV8833.cpp
-    ├── Encoder/
-    │   ├── Encoder.h
-    │   └── Encoder.cpp
-    ├── Motor/
-    │   ├── Motor.h
-    │   └── Motor.cpp
-    └── Communication/
-        ├── UART_Comm.h
-        └── UART_Comm.cpp
-```
+### Local Motor 4
+- PWM A: GPIO 27
+- PWM B: GPIO 14
+- Encoder A: GPIO 32
+- Encoder B: GPIO 33
 
-## Building & Uploading
+### UART
 
-### Build Primary Firmware
+Primary ESP32:
+- Serial2 RX: GPIO 4
+- Serial2 TX: GPIO 23
+
+Secondary ESP32:
+- Serial2 RX: GPIO 23
+- Serial2 TX: GPIO 4
+
+Baud:
+- `115200`
+
+## Build
+
+Build primary:
+
 ```bash
 platformio run -e primary
 ```
 
-### Upload to Primary ESP32
-```bash
-platformio run -e primary -t upload
-```
+Build secondary:
 
-### Build Secondary Firmware
 ```bash
 platformio run -e secondary
 ```
 
-### Upload to Secondary ESP32
+Upload primary:
+
+```bash
+platformio run -e primary -t upload
+```
+
+Upload secondary:
+
 ```bash
 platformio run -e secondary -t upload
 ```
 
-### Monitor Serial Output
+Monitor serial:
+
 ```bash
-platformio device monitor -e primary   # Primary
-platformio device monitor -e secondary # Secondary
+platformio device monitor -e primary
+platformio device monitor -e secondary
 ```
 
-## Primary ESP32 - USB Serial Commands
+## Primary Serial Commands
 
-Send commands via USB Serial (115200 baud):
+Commands are entered on the primary USB serial port at `115200`.
 
-| Command | Description | Example |
-|---------|-------------|---------|
-| `m1<speed>` | Set motor 1 speed (-255 to 255) | `m1100` |
-| `m2<speed>` | Set motor 2 speed (-255 to 255) | `m2-150` |
-| `s1` | Stop motor 1 | `s1` |
-| `s2` | Stop motor 2 | `s2` |
-| `sa` | Stop all motors | `sa` |
-| `d` | Request encoder data | `d` |
+- `h`
+  - Show help
+- `cf`
+  - Calibrate encoder direction on motors 1-8
+- `c2`
+  - Run the current staged calibration routine for pairs `2,1`, `6,5`, `4,3`, `8,7`
+- `j<id>f`
+  - Jog motor forward
+- `j<id>b`
+  - Jog motor backward
+- `j<id><f|b>,<counts>,<tol>`
+  - Relative encoder move
+- `p<id>,<pos>,<tol>`
+  - Move one motor to encoder position
+- `p<id>,<pos>,<tol>;<id>,<pos>,<tol>`
+  - Move multiple motors at once
+- `s<id>`
+  - Stop one motor
+- `sa`
+  - Stop all motors
+- `e`
+  - Print all encoder counts
+- `ra`
+  - Reset all encoder counts to zero
+- `mz`
+  - Move all motors to encoder position 0 with tolerance 5
 
-### Serial Output Format
-```
-M1 Pos: 1234 Spd: 567 | M2 Pos: 5678 Spd: 890
-```
-- **Pos**: Encoder pulse count (position)
-- **Spd**: Encoder speed in pulses per second
+Examples:
 
-## Communication Protocol
-
-### Command Packet (Motor Control)
-```
-[Type: 1 byte] [Motor ID: 1 byte] [Speed MSB: 1 byte] [Speed LSB: 1 byte] [Checksum: 1 byte]
-```
-
-### Data Packet (Encoder Feedback)
-```
-[Type: 1 byte] [Motor ID: 1 byte] [Pos 24-31: 1 byte] [Pos 16-23: 1 byte] 
-[Pos 8-15: 1 byte] [Pos 0-7: 1 byte] [Speed MSB: 1 byte] [Speed LSB: 1 byte] [Checksum: 1 byte]
-```
-
-Checksum is XOR of all data bytes.
-
-## Class Reference
-
-### DRV8833
-Dual motor driver controller using PWM.
-```cpp
-DRV8833 driver(motor1_a, motor1_b, motor2_a, motor2_b);
-driver.init();
-driver.setMotor1Speed(200);  // 0-255 forward, 0 stop, -255 reverse
-driver.stopAll();
+```text
+j2f
+j2b,1000,5
+p1,500,5;p2,500,5;p3,500,5;p4,500,5
+sa
+ra
+c2
 ```
 
-### Encoder
-Quadrature encoder reader with interrupt support.
-```cpp
-Encoder enc(pin_a, pin_b);
-enc.init();
-int32_t pos = enc.getPulseCount();
-int32_t spd = enc.getSpeed();  // pulses/second
-```
+## Communication Layer
 
-### Motor
-Combined motor + encoder controller.
-```cpp
-Motor motor(&driver, &encoder, motor_id);
-motor.init();
-motor.setSpeed(150);
-int32_t position = motor.getPosition();
-int32_t speed = motor.getEncoderSpeed();
-```
+The two boards communicate through `UART_Comm`.
 
-### UART_Comm
-Serial communication protocol between ESP32s.
-```cpp
-UART_Comm uart(rx_pin, tx_pin, baud_rate);
-uart.init();
+Current packet families include:
+- short command packets for speed, stop, reset, calibration, stall-run, ack
+- position command packets
+- encoder feedback packets
 
-UART_Comm::MotorCommand cmd;
-cmd.type = UART_Comm::CMD_SET_MOTOR_SPEED;
-cmd.motor_id = 1;
-cmd.speed = 200;
-uart.sendCommand(cmd);
-```
+The secondary periodically sends encoder feedback for its four motors, and the primary keeps a mirrored remote state table for motors 5-8.
 
-## Wiring Checklist
+## Main Classes
 
-- [ ] Primary ESP32 connected to PC via USB
-- [ ] Secondary ESP32 powered independently
-- [ ] UART lines connected (TX→RX, RX→TX, GND common)
-- [ ] DRV8833 PWM pins connected to GPIO
-- [ ] Motor encoder pins connected to GPIO (with pull-ups if needed)
-- [ ] Motors connected to DRV8833 outputs
-- [ ] 5V power supply for motors (if needed)
+### `DRV8833`
 
-## Troubleshooting
+Low-level dual motor driver wrapper.
+- configures PWM channels
+- sets signed motor speed
+- handles stop behavior
 
-**Motors not responding:**
-- Check GPIO pin assignments match your connections
-- Verify DRV8833 is getting power
-- Test PWM output with multimeter or oscilloscope
+### `Encoder`
 
-**Encoder not reading:**
-- Verify encoder pins and pull-up resistors
-- Check encoder wiring (A, B, GND)
-- Count encoder pulses per motor revolution
+Quadrature encoder reader.
+- interrupt-driven count updates
+- exposes pulse count
+- computes speed over a time window
 
-**UART communication failing:**
-- Verify TX/RX are crossed between devices
-- Check baud rate matches (115200)
-- Ensure GND is common between devices
-- Monitor with logic analyzer if available
+### `Motor`
 
-## Future Enhancements
+Combines one driver channel and one encoder.
+- signed speed control
+- logical encoder inversion
+- position access
+- shared stall safety logic
 
-- [ ] PID control loops for motor speed regulation
-- [ ] Position control with target setpoint
-- [ ] Acceleration/deceleration profiles
-- [ ] Motor current monitoring
-- [ ] Web interface for control
-- [ ] Telemetry logging
+### `UART_Comm`
+
+Serial protocol wrapper used between primary and secondary.
+- sends and receives command packets
+- sends and receives encoder feedback
+- performs checksum validation
 
 ## Notes
 
-- PWM frequency is 5kHz (configurable in DRV8833.h)
-- Encoder readings use GPIO interrupts
-- UART feedback runs at ~100ms intervals
-- Speed calculation uses 100ms windows
+- The top-level `src/main.cpp` is only a placeholder and is not built.
+- The active firmware lives in:
+  - `src/primary/main.cpp`
+  - `src/secondary/main.cpp`
+- Secondary motors are direction-compensated in software because of their physical mounting.
+- The project currently uses a local PlatformIO core directory during development, which is intentionally excluded from Git.
 
+## Next Documentation Improvements
+
+- Document the full tendon routing and motor-to-finger mapping
+- Add a board wiring diagram
+- Add a command reference table with expected responses
+- Document the current calibration workflow in more detail

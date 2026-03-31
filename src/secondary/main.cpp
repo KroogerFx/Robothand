@@ -44,6 +44,8 @@
 #define POSITION_SETTLE_TIME_MS 200
 #define CALIBRATION_SETTLE_MS 75
 #define STALL_CALIBRATION_MAX_RUNTIME_MS 5000
+#define MOTOR_ODD_MAX_POSITION 3000
+#define MOTOR_EVEN_MAX_POSITION 3500
 
 // ===== HARDWARE OBJECTS =====
 DRV8833 driver1(MOTOR1_PWM_A, MOTOR1_PWM_B, MOTOR2_PWM_A, MOTOR2_PWM_B);
@@ -75,6 +77,43 @@ struct PositionMoveState {
 };
 
 PositionMoveState position_moves[4];
+bool travel_limits_enabled = false;
+
+void clearPositionMove(uint8_t motor_id);
+
+int32_t getMotorMinLimit(uint8_t motor_id) {
+    (void)motor_id;
+    return 0;
+}
+
+int32_t getMotorMaxLimit(uint8_t motor_id) {
+    return (motor_id % 2 == 0) ? MOTOR_EVEN_MAX_POSITION
+                               : MOTOR_ODD_MAX_POSITION;
+}
+
+int32_t clampMotorTargetToLimits(uint8_t motor_id, int32_t target) {
+    if (!travel_limits_enabled) {
+        return target;
+    }
+
+    return constrain(target, getMotorMinLimit(motor_id), getMotorMaxLimit(motor_id));
+}
+
+bool isCommandTowardMotorLimit(uint8_t motor_id, int16_t speed, int32_t position) {
+    if (!travel_limits_enabled) {
+        return false;
+    }
+
+    if (speed > 0 && position >= getMotorMaxLimit(motor_id)) {
+        return true;
+    }
+
+    if (speed < 0 && position <= getMotorMinLimit(motor_id)) {
+        return true;
+    }
+
+    return false;
+}
 
 bool isMotorCommandInverted(uint8_t motor_id) {
     // System motors 5-8 map to secondary motors 1-4 and are mounted reversed.
@@ -87,6 +126,16 @@ int16_t applyMotorCommandDirection(uint8_t motor_id, int16_t speed) {
 
 void setMotorCommandSpeed(uint8_t motor_id, Motor* motor, int16_t speed) {
     if (motor != nullptr) {
+        int32_t current_position = motor->getPosition();
+        if (isCommandTowardMotorLimit(motor_id, speed, current_position)) {
+            motor->stop();
+            clearPositionMove(motor_id);
+            Serial.print("Safety limit stop: motor ");
+            Serial.print(motor_id);
+            Serial.println(" reached travel limit");
+            return;
+        }
+
         motor->setSpeed(applyMotorCommandDirection(motor_id, speed));
     }
 }
@@ -130,6 +179,8 @@ void startPositionMove(uint8_t motor_id, int32_t target, int32_t tolerance) {
     if (motor_id < 1 || motor_id > 4 || tolerance < 0) {
         return;
     }
+
+    target = clampMotorTargetToLimits(motor_id, target);
 
     position_moves[motor_id - 1].active = true;
     position_moves[motor_id - 1].hold_enabled = true;
@@ -218,6 +269,18 @@ void updatePositionMoves() {
             continue;
         }
 
+        if (isCommandTowardMotorLimit(
+                motor_id,
+                error > 0 ? POSITION_MOVE_SPEED : -POSITION_MOVE_SPEED,
+                current_position)) {
+            motor->stop();
+            clearPositionMove(motor_id);
+            Serial.print("Safety limit stop: motor ");
+            Serial.print(motor_id);
+            Serial.println(" reached travel limit");
+            continue;
+        }
+
         if (move.last_abs_error == 0x7fffffff ||
             abs_error + POSITION_PROGRESS_MARGIN_COUNTS < move.last_abs_error) {
             move.last_abs_error = abs_error;
@@ -261,7 +324,7 @@ void setup() {
     motor4.init();
 
     uart_comm.init();
-
+    travel_limits_enabled = false;
     Serial.println("====================================");
     Serial.println("SECONDARY ESP32 - Motor Controller");
     Serial.println("====================================");
@@ -309,6 +372,7 @@ void loop() {
                 case UART_Comm::CMD_SET_MOTOR_SPEED: {
                     Motor* local_motor = getLocalMotor(cmd.motor_id);
                     if (local_motor != nullptr) {
+                        clearPositionMove(cmd.motor_id);
                         setMotorCommandSpeed(cmd.motor_id, local_motor, cmd.speed);
                         Serial.print("Motor ");
                         Serial.print(cmd.motor_id);
@@ -346,6 +410,7 @@ void loop() {
                         motor2.resetPosition();
                         motor3.resetPosition();
                         motor4.resetPosition();
+                        travel_limits_enabled = true;
                         for (uint8_t i = 0; i < 4; i++) {
                             position_moves[i].active = false;
                         }
@@ -354,6 +419,7 @@ void loop() {
                         Motor* local_motor = getLocalMotor(cmd.motor_id);
                         if (local_motor != nullptr) {
                             local_motor->resetPosition();
+                            travel_limits_enabled = true;
                             clearPositionMove(cmd.motor_id);
                             Serial.print("Motor ");
                             Serial.print(cmd.motor_id);
