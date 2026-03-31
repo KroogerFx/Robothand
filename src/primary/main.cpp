@@ -6,6 +6,7 @@
 #include "../lib/DRV8833/DRV8833.h"
 #include "../lib/Encoder/Encoder.h"
 #include "../lib/Motor/Motor.h"
+#include "../lib/Finger/Finger.h"
 #include "../lib/Communication/UART_Comm.h"
 
 // ===== PIN CONFIGURATION =====
@@ -47,7 +48,7 @@
 #define STALL_CALIBRATION_MIN_MOVEMENT_COUNTS 50
 #define STALL_CALIBRATION_MAX_RUNTIME_MS 5000
 #define STALL_CALIBRATION_BACKOFF_COUNTS 50
-#define STALL_CALIBRATION_BACKOFF_TOLERANCE 5
+#define STALL_CALIBRATION_BACKOFF_TOLERANCE 10
 #define CAL2_STALL_SPEED 128
 #define CAL2_STALL_WINDOW_MS 100
 #define CAL2_STALL_MIN_MOVING_COUNTS 60
@@ -56,6 +57,10 @@
 #define CAL2_EVEN_FINAL_BACKOFF_COUNTS 3500
 #define CAL2_ODD_FINAL_BACKOFF_COUNTS 3000
 #define CAL2_SETTLE_MS 100
+#define FINGER_DEMO_TOLERANCE 5
+#define FINGER_DEMO_STAGGER_MS 150
+#define FINGER_DEMO_TIMEOUT_MS 8000
+#define FINGER_DEMO_SETTLE_MS 100
 #define MOTOR_ODD_MAX_POSITION 3000
 #define MOTOR_EVEN_MAX_POSITION 3500
 
@@ -117,11 +122,19 @@ struct JogMoveInput {
     int32_t tolerance = 0;
 };
 
+struct FingerCommandInput {
+    uint8_t finger_id = 0;
+    int32_t proximal_target = 0;
+    int32_t distal_target = 0;
+    int32_t tolerance = 0;
+};
+
 void startPositionMove(
     uint8_t motor_id,
     int32_t target,
     int32_t tolerance,
     bool hold_enabled = true);
+void startFingerMotorMove(uint8_t motor_id, int32_t target, int32_t tolerance);
 void clearPositionMove(uint8_t motor_id);
 int32_t getMotorPositionForCalibration(uint8_t motor_id);
 int32_t getMotorMinLimit(uint8_t motor_id);
@@ -131,6 +144,22 @@ bool isCommandTowardMotorLimit(uint8_t motor_id, int16_t speed, int32_t position
 bool isMotionAllowedAtPosition(uint8_t motor_id, int16_t speed, int32_t position);
 void resetAllEncoderCounts();
 bool refreshRemoteMotorStates();
+Finger* getFinger(uint8_t finger_id);
+void updateControlLoopOnce();
+void updateJogStops();
+void updateLocalPositionMoves();
+void updateLocalMotorSafety();
+bool waitForFingerTargets(
+    const uint8_t* finger_ids,
+    uint8_t finger_count,
+    const int32_t* proximal_targets,
+    const int32_t* distal_targets,
+    int32_t tolerance,
+    unsigned long timeout_ms);
+void runFingerDemo();
+void runPeaceSignDemo();
+void runRockOnDemo();
+void runMiddleFingerDemo();
 
 Motor* getLocalMotor(uint8_t motor_id) {
     switch (motor_id) {
@@ -154,6 +183,25 @@ RemoteMotorState* getRemoteMotor(uint8_t motor_id) {
         return &secondary_motors[motor_id - 1];
     }
     return nullptr;
+}
+
+void startFingerMotorMove(uint8_t motor_id, int32_t target, int32_t tolerance) {
+    startPositionMove(motor_id, target, tolerance);
+}
+
+Finger finger1(1, 2, 1, startFingerMotorMove);
+Finger finger2(2, 6, 5, startFingerMotorMove);
+Finger finger3(3, 4, 3, startFingerMotorMove);
+Finger finger4(4, 8, 7, startFingerMotorMove);
+
+Finger* getFinger(uint8_t finger_id) {
+    switch (finger_id) {
+        case 1: return &finger1;
+        case 2: return &finger2;
+        case 3: return &finger3;
+        case 4: return &finger4;
+        default: return nullptr;
+    }
 }
 
 void sendStopCommand(uint8_t motor_id) {
@@ -363,6 +411,360 @@ bool parseJogCommand(const String& input, JogMoveInput& command) {
     command.has_position_target = true;
 
     return command.counts > 0 && command.tolerance >= 0;
+}
+
+bool parseFingerCommandSegment(const String& segment, FingerCommandInput& command) {
+    String trimmed = segment;
+    trimmed.trim();
+
+    if (trimmed.length() < 2 || tolower(trimmed.charAt(0)) != 'f') {
+        return false;
+    }
+
+    int first_comma = trimmed.indexOf(',');
+    int second_comma = trimmed.indexOf(',', first_comma + 1);
+    int third_comma = trimmed.indexOf(',', second_comma + 1);
+
+    if (first_comma <= 1 || second_comma <= first_comma) {
+        return false;
+    }
+
+    command.finger_id = trimmed.substring(1, first_comma).toInt();
+    command.proximal_target = trimmed.substring(first_comma + 1, second_comma).toInt();
+
+    if (third_comma == -1) {
+        command.distal_target = trimmed.substring(second_comma + 1).toInt();
+        command.tolerance = 5;
+    } else {
+        command.distal_target = trimmed.substring(second_comma + 1, third_comma).toInt();
+        command.tolerance = trimmed.substring(third_comma + 1).toInt();
+    }
+
+    return command.finger_id >= 1 && command.finger_id <= 4 && command.tolerance >= 0;
+}
+
+void startFingerMove(
+    uint8_t finger_id,
+    int32_t proximal_target,
+    int32_t distal_target,
+    int32_t tolerance) {
+    Finger* finger = getFinger(finger_id);
+    if (finger == nullptr) {
+        Serial.println("Invalid finger ID. Use 1-4.");
+        return;
+    }
+
+    finger->moveToPositions(proximal_target, distal_target, tolerance);
+    Serial.print("Moving finger ");
+    Serial.print(finger_id);
+    Serial.print(" to proximal ");
+    Serial.print(proximal_target);
+    Serial.print(", distal ");
+    Serial.print(distal_target);
+    Serial.print(" +/- ");
+    Serial.println(tolerance);
+}
+
+void updateControlLoopOnce() {
+    static unsigned long last_remote_request_time = 0;
+
+    updateRemoteEncoderStates();
+    updateJogStops();
+    updateLocalPositionMoves();
+    updateLocalMotorSafety();
+
+    unsigned long now = millis();
+    if (now - last_remote_request_time >= 20) {
+        requestEncoderData();
+        last_remote_request_time = now;
+    }
+
+    delay(5);
+}
+
+bool waitForFingerTargets(
+    const uint8_t* finger_ids,
+    uint8_t finger_count,
+    const int32_t* proximal_targets,
+    const int32_t* distal_targets,
+    int32_t tolerance,
+    unsigned long timeout_ms) {
+    unsigned long start_time = millis();
+    unsigned long in_tolerance_since = 0;
+
+    while (millis() - start_time < timeout_ms) {
+        updateControlLoopOnce();
+
+        bool all_in_tolerance = true;
+        for (uint8_t i = 0; i < finger_count; i++) {
+            Finger* finger = getFinger(finger_ids[i]);
+            if (finger == nullptr) {
+                return false;
+            }
+
+            int32_t proximal_position =
+                getMotorPositionForCalibration(finger->getProximalMotorId());
+            int32_t distal_position =
+                getMotorPositionForCalibration(finger->getDistalMotorId());
+
+            if (abs(proximal_targets[i] - proximal_position) > tolerance ||
+                abs(distal_targets[i] - distal_position) > tolerance) {
+                all_in_tolerance = false;
+                break;
+            }
+        }
+
+        if (all_in_tolerance) {
+            if (in_tolerance_since == 0) {
+                in_tolerance_since = millis();
+            } else if (millis() - in_tolerance_since >= FINGER_DEMO_SETTLE_MS) {
+                return true;
+            }
+        } else {
+            in_tolerance_since = 0;
+        }
+    }
+
+    return false;
+}
+
+void runFingerDemo() {
+    const uint8_t finger_ids[4] = {1, 2, 3, 4};
+    int32_t curl_proximal_targets[4];
+    int32_t curl_distal_targets[4];
+    int32_t uncurl_targets[4] = {0, 0, 0, 0};
+
+    Serial.println("Starting finger curl demo");
+
+    for (uint8_t i = 0; i < 4; i++) {
+        Finger* finger = getFinger(finger_ids[i]);
+        if (finger == nullptr) {
+            Serial.println("Finger demo aborted: invalid finger mapping");
+            return;
+        }
+
+        curl_proximal_targets[i] = getMotorMaxLimit(finger->getProximalMotorId());
+        curl_distal_targets[i] = getMotorMaxLimit(finger->getDistalMotorId());
+
+        startFingerMove(
+            finger_ids[i],
+            curl_proximal_targets[i],
+            curl_distal_targets[i],
+            FINGER_DEMO_TOLERANCE);
+
+        unsigned long stagger_start = millis();
+        while (millis() - stagger_start < FINGER_DEMO_STAGGER_MS) {
+            updateControlLoopOnce();
+        }
+    }
+
+    if (!waitForFingerTargets(
+            finger_ids,
+            4,
+            curl_proximal_targets,
+            curl_distal_targets,
+            FINGER_DEMO_TOLERANCE,
+            FINGER_DEMO_TIMEOUT_MS)) {
+        Serial.println("Finger demo curl timed out");
+        return;
+    }
+
+    Serial.println("Finger demo uncurling");
+
+    for (uint8_t i = 0; i < 4; i++) {
+        startFingerMove(finger_ids[i], 0, 0, FINGER_DEMO_TOLERANCE);
+
+        unsigned long stagger_start = millis();
+        while (millis() - stagger_start < FINGER_DEMO_STAGGER_MS) {
+            updateControlLoopOnce();
+        }
+    }
+
+    if (!waitForFingerTargets(
+            finger_ids,
+            4,
+            uncurl_targets,
+            uncurl_targets,
+            FINGER_DEMO_TOLERANCE,
+            FINGER_DEMO_TIMEOUT_MS)) {
+        Serial.println("Finger demo uncurl timed out");
+        return;
+    }
+
+    Serial.println("Finger demo complete");
+}
+
+void runPeaceSignDemo() {
+    const uint8_t finger_ids[4] = {1, 2, 3, 4};
+    int32_t proximal_targets[4];
+    int32_t distal_targets[4];
+
+    Serial.println("Starting peace sign demo");
+
+    for (uint8_t i = 0; i < 4; i++) {
+        Finger* finger = getFinger(finger_ids[i]);
+        if (finger == nullptr) {
+            Serial.println("Peace sign demo aborted: invalid finger mapping");
+            return;
+        }
+
+        bool extend_finger = finger_ids[i] == 1 || finger_ids[i] == 2;
+        proximal_targets[i] = extend_finger ? 0 : getMotorMaxLimit(finger->getProximalMotorId());
+        distal_targets[i] = extend_finger ? 0 : getMotorMaxLimit(finger->getDistalMotorId());
+
+        startFingerMove(
+            finger_ids[i],
+            proximal_targets[i],
+            distal_targets[i],
+            FINGER_DEMO_TOLERANCE);
+
+        unsigned long stagger_start = millis();
+        while (millis() - stagger_start < FINGER_DEMO_STAGGER_MS) {
+            updateControlLoopOnce();
+        }
+    }
+
+    if (!waitForFingerTargets(
+            finger_ids,
+            4,
+            proximal_targets,
+            distal_targets,
+            FINGER_DEMO_TOLERANCE,
+            FINGER_DEMO_TIMEOUT_MS)) {
+        Serial.println("Peace sign demo timed out");
+        return;
+    }
+
+    Serial.println("Peace sign demo complete");
+}
+
+void runRockOnDemo() {
+    const uint8_t finger_ids[4] = {1, 2, 3, 4};
+    int32_t proximal_targets[4];
+    int32_t distal_targets[4];
+
+    Serial.println("Starting rock on demo");
+
+    for (uint8_t i = 0; i < 4; i++) {
+        Finger* finger = getFinger(finger_ids[i]);
+        if (finger == nullptr) {
+            Serial.println("Rock on demo aborted: invalid finger mapping");
+            return;
+        }
+
+        bool extend_finger = finger_ids[i] == 1 || finger_ids[i] == 4;
+        proximal_targets[i] = extend_finger ? 0 : getMotorMaxLimit(finger->getProximalMotorId());
+        distal_targets[i] = extend_finger ? 0 : getMotorMaxLimit(finger->getDistalMotorId());
+
+        startFingerMove(
+            finger_ids[i],
+            proximal_targets[i],
+            distal_targets[i],
+            FINGER_DEMO_TOLERANCE);
+
+        unsigned long stagger_start = millis();
+        while (millis() - stagger_start < FINGER_DEMO_STAGGER_MS) {
+            updateControlLoopOnce();
+        }
+    }
+
+    if (!waitForFingerTargets(
+            finger_ids,
+            4,
+            proximal_targets,
+            distal_targets,
+            FINGER_DEMO_TOLERANCE,
+            FINGER_DEMO_TIMEOUT_MS)) {
+        Serial.println("Rock on demo timed out");
+        return;
+    }
+
+    Serial.println("Rock on demo complete");
+}
+
+void runMiddleFingerDemo() {
+    const uint8_t finger_ids[4] = {1, 2, 3, 4};
+    int32_t proximal_targets[4];
+    int32_t distal_targets[4];
+
+    Serial.println("Starting middle finger demo");
+
+    for (uint8_t i = 0; i < 4; i++) {
+        Finger* finger = getFinger(finger_ids[i]);
+        if (finger == nullptr) {
+            Serial.println("Middle finger demo aborted: invalid finger mapping");
+            return;
+        }
+
+        bool extend_finger = finger_ids[i] == 2;
+        proximal_targets[i] = extend_finger ? 0 : getMotorMaxLimit(finger->getProximalMotorId());
+        distal_targets[i] = extend_finger ? 0 : getMotorMaxLimit(finger->getDistalMotorId());
+
+        startFingerMove(
+            finger_ids[i],
+            proximal_targets[i],
+            distal_targets[i],
+            FINGER_DEMO_TOLERANCE);
+
+        unsigned long stagger_start = millis();
+        while (millis() - stagger_start < FINGER_DEMO_STAGGER_MS) {
+            updateControlLoopOnce();
+        }
+    }
+
+    if (!waitForFingerTargets(
+            finger_ids,
+            4,
+            proximal_targets,
+            distal_targets,
+            FINGER_DEMO_TOLERANCE,
+            FINGER_DEMO_TIMEOUT_MS)) {
+        Serial.println("Middle finger demo timed out");
+        return;
+    }
+
+    Serial.println("Middle finger demo complete");
+}
+
+bool handleFingerCommands(const String& input) {
+    FingerCommandInput commands[4];
+    uint8_t command_count = 0;
+    int start_index = 0;
+    bool parsed_all_segments = false;
+
+    while (start_index < input.length() && command_count < 4) {
+        int separator_index = input.indexOf(';', start_index);
+        String segment = separator_index == -1
+            ? input.substring(start_index)
+            : input.substring(start_index, separator_index);
+
+        if (!parseFingerCommandSegment(segment, commands[command_count])) {
+            return false;
+        }
+
+        command_count++;
+
+        if (separator_index == -1) {
+            parsed_all_segments = true;
+            break;
+        }
+
+        start_index = separator_index + 1;
+    }
+
+    if (command_count == 0 || !parsed_all_segments) {
+        return false;
+    }
+
+    for (uint8_t i = 0; i < command_count; i++) {
+        startFingerMove(
+            commands[i].finger_id,
+            commands[i].proximal_target,
+            commands[i].distal_target,
+            commands[i].tolerance);
+    }
+
+    return true;
 }
 
 void startJogMove(uint8_t motor_id, bool forward, int32_t counts, int32_t tolerance) {
@@ -1050,6 +1452,12 @@ void printHelp() {
     Serial.println("  j<id><f|b>,<counts>,<tol> - Move motor relative by encoder counts");
     Serial.println("  p<id>,<pos>,<tol> - Move motor to encoder position");
     Serial.println("  p<id>,<pos>,<tol>;<id>,<pos>,<tol> - Move multiple motors together");
+    Serial.println("  f<id>,<prox>,<dist>[,<tol>] - Move finger proximal/distal joints together");
+    Serial.println("  f...;f...     - Chain multiple finger move commands");
+    Serial.println("  fd            - Demo fingers curling and uncurling in order");
+    Serial.println("  fp            - Demo a peace sign pose");
+    Serial.println("  fr            - Demo a rock on pose");
+    Serial.println("  fm            - Demo a middle finger pose");
     Serial.println("  s<id>         - Stop motor 1-8");
     Serial.println("  sa            - Stop all motors");
     Serial.println("  e             - Show encoder counts for motors 1-8");
@@ -1095,6 +1503,7 @@ void loop() {
             bool is_motion_command =
                 (cmd == 'j') ||
                 (cmd == 'p') ||
+                (cmd == 'f') ||
                 (cmd == 'm' && input.length() > 1 && input[1] == 'z') ||
                 (cmd == 'c' && input.length() > 1 && input[1] == '2');
 
@@ -1118,6 +1527,18 @@ void loop() {
             } else if (cmd == 'p') {
                 if (!handlePositionCommands(input)) {
                     Serial.println("Use p<id>,<position>,<tolerance> or separate multiple moves with ;");
+                }
+            } else if (cmd == 'f') {
+                if (input.equalsIgnoreCase("fd")) {
+                    runFingerDemo();
+                } else if (input.equalsIgnoreCase("fp")) {
+                    runPeaceSignDemo();
+                } else if (input.equalsIgnoreCase("fr")) {
+                    runRockOnDemo();
+                } else if (input.equalsIgnoreCase("fm")) {
+                    runMiddleFingerDemo();
+                } else if (!handleFingerCommands(input)) {
+                    Serial.println("Use f<id>,<proximal_position>,<distal_position>[,<tolerance>] and separate multiple finger moves with ;");
                 }
             } else if (cmd == 's' && input.length() > 1) {
                 if (input[1] == 'a') {
