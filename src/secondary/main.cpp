@@ -42,6 +42,8 @@
 #define JOG_DURATION_MS 37
 #define POSITION_MOVE_SPEED 170
 #define POSITION_SETTLE_TIME_MS 200
+#define MIN_GENERAL_MOVE_SPEED 60
+#define MAX_GENERAL_MOVE_SPEED 255
 #define CALIBRATION_SETTLE_MS 75
 #define STALL_CALIBRATION_MAX_RUNTIME_MS 5000
 #define MOTOR_ODD_MAX_POSITION 3000
@@ -71,6 +73,7 @@ struct PositionMoveState {
     bool hold_enabled = true;
     int32_t target = 0;
     int32_t tolerance = 0;
+    int16_t move_speed = POSITION_MOVE_SPEED;
     unsigned long in_tolerance_since = 0;
     int32_t last_abs_error = 0;
     unsigned long last_progress_time = 0;
@@ -78,8 +81,10 @@ struct PositionMoveState {
 
 PositionMoveState position_moves[4];
 bool travel_limits_enabled = false;
+int16_t general_move_speed = POSITION_MOVE_SPEED;
 
 void clearPositionMove(uint8_t motor_id);
+int16_t clampGeneralMoveSpeed(int32_t speed);
 
 int32_t getMotorMinLimit(uint8_t motor_id) {
     (void)motor_id;
@@ -169,13 +174,24 @@ void clearPositionMove(uint8_t motor_id) {
         position_moves[motor_id - 1].hold_enabled = true;
         position_moves[motor_id - 1].target = 0;
         position_moves[motor_id - 1].tolerance = 0;
+        position_moves[motor_id - 1].move_speed = POSITION_MOVE_SPEED;
         position_moves[motor_id - 1].in_tolerance_since = 0;
         position_moves[motor_id - 1].last_abs_error = 0;
         position_moves[motor_id - 1].last_progress_time = 0;
     }
 }
 
-void startPositionMove(uint8_t motor_id, int32_t target, int32_t tolerance) {
+int16_t clampGeneralMoveSpeed(int32_t speed) {
+    if (speed < MIN_GENERAL_MOVE_SPEED) {
+        return MIN_GENERAL_MOVE_SPEED;
+    }
+    if (speed > MAX_GENERAL_MOVE_SPEED) {
+        return MAX_GENERAL_MOVE_SPEED;
+    }
+    return (int16_t)speed;
+}
+
+void startPositionMove(uint8_t motor_id, int32_t target, int32_t tolerance, int16_t move_speed) {
     if (motor_id < 1 || motor_id > 4 || tolerance < 0) {
         return;
     }
@@ -186,6 +202,7 @@ void startPositionMove(uint8_t motor_id, int32_t target, int32_t tolerance) {
     position_moves[motor_id - 1].hold_enabled = true;
     position_moves[motor_id - 1].target = target;
     position_moves[motor_id - 1].tolerance = tolerance;
+    position_moves[motor_id - 1].move_speed = clampGeneralMoveSpeed(move_speed);
     position_moves[motor_id - 1].in_tolerance_since = 0;
     position_moves[motor_id - 1].last_abs_error = 0x7fffffff;
     position_moves[motor_id - 1].last_progress_time = millis();
@@ -271,7 +288,7 @@ void updatePositionMoves() {
 
         if (isCommandTowardMotorLimit(
                 motor_id,
-                error > 0 ? POSITION_MOVE_SPEED : -POSITION_MOVE_SPEED,
+                error > 0 ? move.move_speed : -move.move_speed,
                 current_position)) {
             motor->stop();
             clearPositionMove(motor_id);
@@ -295,7 +312,7 @@ void updatePositionMoves() {
         }
 
         move.in_tolerance_since = 0;
-        setMotorCommandSpeed(motor_id, motor, error > 0 ? POSITION_MOVE_SPEED : -POSITION_MOVE_SPEED);
+        setMotorCommandSpeed(motor_id, motor, error > 0 ? move.move_speed : -move.move_speed);
     }
 }
 
@@ -347,14 +364,17 @@ void loop() {
             }
 
             blinkStatusLed();
-            startPositionMove(pos_cmd.motor_id, pos_cmd.target_position, pos_cmd.tolerance);
+            startPositionMove(pos_cmd.motor_id, pos_cmd.target_position, pos_cmd.tolerance, pos_cmd.move_speed);
             Serial.print("Motor ");
             Serial.print(pos_cmd.motor_id);
             Serial.print(" target: ");
             Serial.print(pos_cmd.target_position);
             Serial.print(" +/- ");
-            Serial.println(pos_cmd.tolerance);
+            Serial.print(pos_cmd.tolerance);
+            Serial.print(" speed ");
+            Serial.println(pos_cmd.move_speed);
         } else if (packet_type == UART_Comm::CMD_SET_MOTOR_SPEED ||
+                   packet_type == UART_Comm::CMD_SET_POSITION_MOVE_SPEED ||
                    packet_type == UART_Comm::CMD_GET_ENCODER_DATA ||
                    packet_type == UART_Comm::CMD_STOP_MOTOR ||
                    packet_type == UART_Comm::CMD_RESET_ENCODER ||
@@ -381,6 +401,12 @@ void loop() {
                     }
                     break;
                 }
+
+                case UART_Comm::CMD_SET_POSITION_MOVE_SPEED:
+                    general_move_speed = clampGeneralMoveSpeed(cmd.speed);
+                    Serial.print("General move speed set to ");
+                    Serial.println(general_move_speed);
+                    break;
 
                 case UART_Comm::CMD_STOP_MOTOR:
                     if (cmd.motor_id == 0) {

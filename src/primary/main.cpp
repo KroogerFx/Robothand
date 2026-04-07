@@ -41,6 +41,8 @@
 #define JOG_DURATION_MS 37
 #define POSITION_MOVE_SPEED 170
 #define POSITION_SETTLE_TIME_MS 200
+#define MIN_GENERAL_MOVE_SPEED 60
+#define MAX_GENERAL_MOVE_SPEED 255
 #define RETURN_TO_ZERO_TOLERANCE 5
 #define CALIBRATION_SETTLE_MS 75
 #define CALIBRATION_TIMEOUT_MS 1500
@@ -99,6 +101,7 @@ struct PositionMoveState {
     bool hold_enabled = true;
     int32_t target = 0;
     int32_t tolerance = 0;
+    int16_t move_speed = POSITION_MOVE_SPEED;
     unsigned long in_tolerance_since = 0;
     int32_t last_abs_error = 0;
     unsigned long last_progress_time = 0;
@@ -107,6 +110,7 @@ struct PositionMoveState {
 PositionMoveState position_moves[8];
 bool motion_commands_enabled = false;
 bool travel_limits_enabled = false;
+int16_t general_move_speed = POSITION_MOVE_SPEED;
 
 struct PositionCommandInput {
     uint8_t motor_id = 0;
@@ -133,7 +137,8 @@ void startPositionMove(
     uint8_t motor_id,
     int32_t target,
     int32_t tolerance,
-    bool hold_enabled = true);
+    bool hold_enabled = true,
+    int16_t move_speed = POSITION_MOVE_SPEED);
 void startFingerMotorMove(uint8_t motor_id, int32_t target, int32_t tolerance);
 void clearPositionMove(uint8_t motor_id);
 int32_t getMotorPositionForCalibration(uint8_t motor_id);
@@ -145,6 +150,12 @@ bool isMotionAllowedAtPosition(uint8_t motor_id, int16_t speed, int32_t position
 void resetAllEncoderCounts();
 bool refreshRemoteMotorStates();
 Finger* getFinger(uint8_t finger_id);
+const char* getMotorControllerLabel(uint8_t motor_id);
+void printCpMotorSnapshot(
+    uint8_t motor_id,
+    const char* phase,
+    int32_t target,
+    int32_t tolerance);
 void updateControlLoopOnce();
 void updateJogStops();
 void updateLocalPositionMoves();
@@ -160,6 +171,10 @@ void runFingerDemo();
 void runPeaceSignDemo();
 void runRockOnDemo();
 void runMiddleFingerDemo();
+int16_t clampGeneralMoveSpeed(int32_t speed);
+void setGeneralMoveSpeed(int16_t speed);
+void sendPositionMoveSpeedCommand(uint8_t secondary_motor_id, int16_t speed);
+void sendPositionMoveCommand(uint8_t motor_id, int32_t target_position, int32_t tolerance, int16_t move_speed);
 
 Motor* getLocalMotor(uint8_t motor_id) {
     switch (motor_id) {
@@ -185,8 +200,53 @@ RemoteMotorState* getRemoteMotor(uint8_t motor_id) {
     return nullptr;
 }
 
+const char* getMotorControllerLabel(uint8_t motor_id) {
+    return getLocalMotor(motor_id) != nullptr ? "primary" : "secondary";
+}
+
+void printCpMotorSnapshot(
+    uint8_t motor_id,
+    const char* phase,
+    int32_t target,
+    int32_t tolerance) {
+    int32_t current_position = getMotorPositionForCalibration(motor_id);
+    int32_t error = target - current_position;
+
+    Serial.print("CP debug: motor ");
+    Serial.print(motor_id);
+    Serial.print(" on ");
+    Serial.print(getMotorControllerLabel(motor_id));
+    Serial.print(" during ");
+    Serial.print(phase);
+    Serial.print(" | current=");
+    Serial.print(current_position);
+    Serial.print(" target=");
+    Serial.print(target);
+    Serial.print(" error=");
+    Serial.print(error);
+    Serial.print(" tolerance=");
+    Serial.print(tolerance);
+
+    Motor* local_motor = getLocalMotor(motor_id);
+    if (local_motor != nullptr) {
+        Serial.print(" commanded_speed=");
+        Serial.print(local_motor->getSpeed());
+    } else {
+        uint8_t secondary_motor_id = toSecondaryMotorId(motor_id);
+        RemoteMotorState* remote_motor = getRemoteMotor(secondary_motor_id);
+        Serial.print(" secondary_id=");
+        Serial.print(secondary_motor_id);
+        if (remote_motor != nullptr) {
+            Serial.print(" reported_speed=");
+            Serial.print(remote_motor->speed);
+        }
+    }
+
+    Serial.println();
+}
+
 void startFingerMotorMove(uint8_t motor_id, int32_t target, int32_t tolerance) {
-    startPositionMove(motor_id, target, tolerance);
+    startPositionMove(motor_id, target, tolerance, true, general_move_speed);
 }
 
 Finger finger1(1, 2, 1, startFingerMotorMove);
@@ -241,7 +301,42 @@ void sendPositionMoveCommand(uint8_t motor_id, int32_t target_position, int32_t 
     cmd_data.motor_id = motor_id;
     cmd_data.target_position = target_position;
     cmd_data.tolerance = tolerance;
+    cmd_data.move_speed = general_move_speed;
     uart_comm.sendPositionCommand(cmd_data);
+}
+
+void sendPositionMoveCommand(uint8_t motor_id, int32_t target_position, int32_t tolerance, int16_t move_speed) {
+    UART_Comm::PositionCommand cmd_data;
+    cmd_data.motor_id = motor_id;
+    cmd_data.target_position = target_position;
+    cmd_data.tolerance = tolerance;
+    cmd_data.move_speed = move_speed;
+    uart_comm.sendPositionCommand(cmd_data);
+}
+
+void sendPositionMoveSpeedCommand(uint8_t secondary_motor_id, int16_t speed) {
+    UART_Comm::MotorCommand cmd_data;
+    cmd_data.type = UART_Comm::CMD_SET_POSITION_MOVE_SPEED;
+    cmd_data.motor_id = secondary_motor_id;
+    cmd_data.speed = speed;
+    uart_comm.sendCommand(cmd_data);
+}
+
+int16_t clampGeneralMoveSpeed(int32_t speed) {
+    if (speed < MIN_GENERAL_MOVE_SPEED) {
+        return MIN_GENERAL_MOVE_SPEED;
+    }
+    if (speed > MAX_GENERAL_MOVE_SPEED) {
+        return MAX_GENERAL_MOVE_SPEED;
+    }
+    return (int16_t)speed;
+}
+
+void setGeneralMoveSpeed(int16_t speed) {
+    general_move_speed = clampGeneralMoveSpeed(speed);
+    for (uint8_t secondary_motor_id = 1; secondary_motor_id <= 4; secondary_motor_id++) {
+        sendPositionMoveSpeedCommand(secondary_motor_id, general_move_speed);
+    }
 }
 
 void sendCalibrateEncoderCommand(uint8_t motor_id) {
@@ -321,7 +416,7 @@ void stopMotorById(uint8_t motor_id) {
 void startJog(uint8_t motor_id, bool forward) {
     Motor* local_motor = getLocalMotor(motor_id);
     uint8_t secondary_motor_id = toSecondaryMotorId(motor_id);
-    int16_t speed = forward ? JOG_SPEED : -JOG_SPEED;
+    int16_t speed = forward ? general_move_speed : -general_move_speed;
     int32_t current_position = 0;
 
     clearPositionMove(motor_id);
@@ -793,7 +888,7 @@ void startJogMove(uint8_t motor_id, bool forward, int32_t counts, int32_t tolera
     }
 
     int32_t target = current_position + (forward ? counts : -counts);
-    startPositionMove(motor_id, target, tolerance);
+    startPositionMove(motor_id, target, tolerance, true, general_move_speed);
 }
 
 void updateJogStops() {
@@ -813,6 +908,7 @@ void clearPositionMove(uint8_t motor_id) {
         position_moves[motor_id - 1].hold_enabled = true;
         position_moves[motor_id - 1].target = 0;
         position_moves[motor_id - 1].tolerance = 0;
+        position_moves[motor_id - 1].move_speed = POSITION_MOVE_SPEED;
         position_moves[motor_id - 1].in_tolerance_since = 0;
         position_moves[motor_id - 1].last_abs_error = 0;
         position_moves[motor_id - 1].last_progress_time = 0;
@@ -823,7 +919,8 @@ void startPositionMove(
     uint8_t motor_id,
     int32_t target,
     int32_t tolerance,
-    bool hold_enabled) {
+    bool hold_enabled,
+    int16_t move_speed) {
     Motor* local_motor = getLocalMotor(motor_id);
     uint8_t secondary_motor_id = toSecondaryMotorId(motor_id);
 
@@ -840,15 +937,17 @@ void startPositionMove(
         position_moves[motor_id - 1].hold_enabled = hold_enabled;
         position_moves[motor_id - 1].target = target;
         position_moves[motor_id - 1].tolerance = tolerance;
+        position_moves[motor_id - 1].move_speed = move_speed;
         position_moves[motor_id - 1].in_tolerance_since = 0;
         position_moves[motor_id - 1].last_abs_error = 0x7fffffff;
         position_moves[motor_id - 1].last_progress_time = millis();
     } else if (secondary_motor_id != 0) {
-        sendPositionMoveCommand(secondary_motor_id, target, tolerance);
+        sendPositionMoveCommand(secondary_motor_id, target, tolerance, move_speed);
         position_moves[motor_id - 1].active = true;
         position_moves[motor_id - 1].hold_enabled = hold_enabled;
         position_moves[motor_id - 1].target = target;
         position_moves[motor_id - 1].tolerance = tolerance;
+        position_moves[motor_id - 1].move_speed = move_speed;
         position_moves[motor_id - 1].in_tolerance_since = 0;
         position_moves[motor_id - 1].last_abs_error = 0x7fffffff;
         position_moves[motor_id - 1].last_progress_time = millis();
@@ -926,7 +1025,7 @@ bool handlePositionCommands(const String& input) {
     }
 
     for (uint8_t i = 0; i < command_count; i++) {
-        startPositionMove(commands[i].motor_id, commands[i].target, commands[i].tolerance);
+        startPositionMove(commands[i].motor_id, commands[i].target, commands[i].tolerance, true, general_move_speed);
     }
 
     return true;
@@ -959,7 +1058,7 @@ void updateLocalPositionMoves() {
 
         if (isCommandTowardMotorLimit(
                 motor_id,
-                error > 0 ? POSITION_MOVE_SPEED : -POSITION_MOVE_SPEED,
+                error > 0 ? move.move_speed : -move.move_speed,
                 current_position)) {
             motor->stop();
             clearPositionMove(motor_id);
@@ -983,7 +1082,7 @@ void updateLocalPositionMoves() {
         }
 
         move.in_tolerance_since = 0;
-        motor->setSpeed(error > 0 ? POSITION_MOVE_SPEED : -POSITION_MOVE_SPEED);
+        motor->setSpeed(error > 0 ? move.move_speed : -move.move_speed);
     }
 }
 
@@ -1023,6 +1122,28 @@ void printAllEncoderCounts() {
     Serial.print(secondary_motors[2].position);
     Serial.print(" | M8: ");
     Serial.println(secondary_motors[3].position);
+}
+
+void printEncoderSnapshot() {
+    requestEncoderData();
+    delay(20);
+    updateRemoteEncoderStates();
+
+    Serial.print("@ENC ");
+    for (uint8_t motor_id = 1; motor_id <= 8; motor_id++) {
+        if (motor_id > 1) {
+            Serial.print(";");
+        }
+        Serial.print("M");
+        Serial.print(motor_id);
+        Serial.print("=");
+        Serial.print(getMotorPositionForCalibration(motor_id));
+        Serial.print(",");
+        Serial.print(getMotorMinLimit(motor_id));
+        Serial.print(",");
+        Serial.print(getMotorMaxLimit(motor_id));
+    }
+    Serial.println();
 }
 
 void printCalibrationResult(uint8_t motor_id, int32_t delta, bool inverted) {
@@ -1098,7 +1219,7 @@ void calibrateEncoderDirections() {
 
 void moveAllMotorsToZero() {
     for (uint8_t motor_id = 1; motor_id <= 8; motor_id++) {
-        startPositionMove(motor_id, 0, RETURN_TO_ZERO_TOLERANCE);
+        startPositionMove(motor_id, 0, RETURN_TO_ZERO_TOLERANCE, true, general_move_speed);
     }
 
     Serial.println("Moving all motors to encoder position 0 +/- 5");
@@ -1209,6 +1330,7 @@ bool waitForMotorHold(uint8_t motor_id, int32_t target, int32_t tolerance) {
     unsigned long start_time = millis();
     unsigned long in_tolerance_since = 0;
     unsigned long last_remote_request_time = 0;
+    int32_t last_position = getMotorPositionForCalibration(motor_id);
 
     while (millis() - start_time < STALL_CALIBRATION_MAX_RUNTIME_MS) {
         updateRemoteEncoderStates();
@@ -1218,6 +1340,7 @@ bool waitForMotorHold(uint8_t motor_id, int32_t target, int32_t tolerance) {
         requestRemoteFeedbackIfNeeded(motor_id, last_remote_request_time);
 
         int32_t current_position = getMotorPositionForCalibration(motor_id);
+        last_position = current_position;
         if (abs(target - current_position) <= tolerance) {
             if (in_tolerance_since == 0) {
                 in_tolerance_since = millis();
@@ -1230,6 +1353,17 @@ bool waitForMotorHold(uint8_t motor_id, int32_t target, int32_t tolerance) {
 
         delay(5);
     }
+
+    Serial.print("CP hold timeout after ");
+    Serial.print(millis() - start_time);
+    Serial.println(" ms");
+    printCpMotorSnapshot(motor_id, "waitForMotorHold timeout", target, tolerance);
+    Serial.print("CP debug: last_position=");
+    Serial.print(last_position);
+    Serial.print(" in_tolerance_since=");
+    Serial.print(in_tolerance_since);
+    Serial.print(" settle_required_ms=");
+    Serial.println(CAL2_SETTLE_MS);
 
     return false;
 }
@@ -1254,6 +1388,8 @@ bool runMotorUntilRateDropStall(uint8_t motor_id, int32_t& stall_position) {
     unsigned long last_remote_request_time = 0;
     int32_t peak_window_counts = 0;
     bool saw_meaningful_motion = false;
+    int32_t last_window_counts = 0;
+    int32_t last_dynamic_threshold = CAL2_STALL_MIN_WINDOW_COUNTS;
 
     setCalibrationMotorSpeed(motor_id, CAL2_STALL_SPEED);
 
@@ -1269,6 +1405,7 @@ bool runMotorUntilRateDropStall(uint8_t motor_id, int32_t& stall_position) {
 
         int32_t current_position = getMotorPositionForCalibration(motor_id);
         int32_t window_counts = abs(current_position - window_start_position);
+        last_window_counts = window_counts;
 
         if (window_counts > peak_window_counts) {
             peak_window_counts = window_counts;
@@ -1281,11 +1418,20 @@ bool runMotorUntilRateDropStall(uint8_t motor_id, int32_t& stall_position) {
         int32_t dynamic_threshold =
             max(CAL2_STALL_MIN_WINDOW_COUNTS,
                 (peak_window_counts * CAL2_STALL_DROP_PERCENT) / 100);
+        last_dynamic_threshold = dynamic_threshold;
 
         if (saw_meaningful_motion && window_counts <= dynamic_threshold) {
             stopMotorById(motor_id);
             refreshRemoteMotorStateIfNeeded(motor_id);
             stall_position = getMotorPositionForCalibration(motor_id);
+            Serial.print("CP debug: motor ");
+            Serial.print(motor_id);
+            Serial.print(" stall detected at position ");
+            Serial.print(stall_position);
+            Serial.print(" peak_window_counts=");
+            Serial.print(peak_window_counts);
+            Serial.print(" dynamic_threshold=");
+            Serial.println(dynamic_threshold);
             return true;
         }
 
@@ -1297,30 +1443,76 @@ bool runMotorUntilRateDropStall(uint8_t motor_id, int32_t& stall_position) {
     Serial.print("Motor ");
     Serial.print(motor_id);
     Serial.println(" stall detect timed out");
+    Serial.print("CP debug: runtime_ms=");
+    Serial.print(millis() - start_time);
+    Serial.print(" start_position=");
+    Serial.print(window_start_position);
+    Serial.print(" current_position=");
+    Serial.print(getMotorPositionForCalibration(motor_id));
+    Serial.print(" last_window_counts=");
+    Serial.print(last_window_counts);
+    Serial.print(" peak_window_counts=");
+    Serial.print(peak_window_counts);
+    Serial.print(" dynamic_threshold=");
+    Serial.print(last_dynamic_threshold);
+    Serial.print(" saw_meaningful_motion=");
+    Serial.println(saw_meaningful_motion ? "true" : "false");
     return false;
 }
 
 bool calibrateLocalMotorToBackoffHold(uint8_t motor_id, int32_t& post50_position) {
     int32_t stall_position = 0;
     if (!runMotorUntilRateDropStall(motor_id, stall_position)) {
+        Serial.print("CP debug: motor ");
+        Serial.print(motor_id);
+        Serial.println(" failed during stall detection phase");
         return false;
     }
 
-    int32_t target_position = stall_position - STALL_CALIBRATION_BACKOFF_COUNTS;
-    startPositionMove(motor_id, target_position, STALL_CALIBRATION_BACKOFF_TOLERANCE, true);
+    int32_t raw_target_position = stall_position - STALL_CALIBRATION_BACKOFF_COUNTS;
+    int32_t target_position = clampMotorTargetToLimits(motor_id, raw_target_position);
+    Serial.print("CP debug: motor ");
+    Serial.print(motor_id);
+    Serial.print(" stall_position=");
+    Serial.print(stall_position);
+    Serial.print(" backoff_target_raw=");
+    Serial.print(raw_target_position);
+    Serial.print(" backoff_target=");
+    Serial.print(target_position);
+    Serial.print(" tolerance=");
+    Serial.println(STALL_CALIBRATION_BACKOFF_TOLERANCE);
+    if (target_position != raw_target_position) {
+        Serial.print("CP debug: motor ");
+        Serial.print(motor_id);
+        Serial.print(" backoff target clamped from ");
+        Serial.print(raw_target_position);
+        Serial.print(" to ");
+        Serial.print(target_position);
+        Serial.println(" due to active travel limits");
+    }
+    startPositionMove(motor_id, target_position, STALL_CALIBRATION_BACKOFF_TOLERANCE, true, POSITION_MOVE_SPEED);
 
     if (!waitForMotorHold(motor_id, target_position, STALL_CALIBRATION_BACKOFF_TOLERANCE)) {
         Serial.print("Motor ");
         Serial.print(motor_id);
         Serial.println(" 50-count hold timed out");
+        printCpMotorSnapshot(
+            motor_id,
+            "post-stall 50-count hold",
+            target_position,
+            STALL_CALIBRATION_BACKOFF_TOLERANCE);
         return false;
     }
 
     post50_position = getMotorPositionForCalibration(motor_id);
+    Serial.print("CP debug: motor ");
+    Serial.print(motor_id);
+    Serial.print(" post50_position=");
+    Serial.println(post50_position);
     return true;
 }
 
-int32_t getC2FinalBackoffCounts(uint8_t motor_id) {
+int32_t getCpFinalBackoffCounts(uint8_t motor_id) {
     return (motor_id % 2 == 0) ? CAL2_EVEN_FINAL_BACKOFF_COUNTS
                                : CAL2_ODD_FINAL_BACKOFF_COUNTS;
 }
@@ -1336,20 +1528,38 @@ void calibrateMotors21ToStallAndHold() {
     int32_t motor7_post50 = 0;
 
     if (!calibrateLocalMotorToBackoffHold(2, motor2_post50)) {
-        Serial.println("C2 aborted on motor 2");
+        Serial.println("CP aborted on motor 2");
         return;
     }
 
     if (!calibrateLocalMotorToBackoffHold(1, motor1_post50)) {
-        Serial.println("C2 aborted on motor 1");
+        Serial.println("CP aborted on motor 1");
         return;
     }
 
-    int32_t motor2_final_target = motor2_post50 - getC2FinalBackoffCounts(2);
-    int32_t motor1_final_target = motor1_post50 - getC2FinalBackoffCounts(1);
+    int32_t motor2_final_target_raw = motor2_post50 - getCpFinalBackoffCounts(2);
+    int32_t motor1_final_target_raw = motor1_post50 - getCpFinalBackoffCounts(1);
+    int32_t motor2_final_target = clampMotorTargetToLimits(2, motor2_final_target_raw);
+    int32_t motor1_final_target = clampMotorTargetToLimits(1, motor1_final_target_raw);
 
-    startPositionMove(2, motor2_final_target, STALL_CALIBRATION_BACKOFF_TOLERANCE, true);
-    startPositionMove(1, motor1_final_target, STALL_CALIBRATION_BACKOFF_TOLERANCE, true);
+    if (motor2_final_target != motor2_final_target_raw) {
+        Serial.print("CP debug: motor 2 final target clamped from ");
+        Serial.print(motor2_final_target_raw);
+        Serial.print(" to ");
+        Serial.print(motor2_final_target);
+        Serial.println(" due to active travel limits");
+    }
+
+    if (motor1_final_target != motor1_final_target_raw) {
+        Serial.print("CP debug: motor 1 final target clamped from ");
+        Serial.print(motor1_final_target_raw);
+        Serial.print(" to ");
+        Serial.print(motor1_final_target);
+        Serial.println(" due to active travel limits");
+    }
+
+    startPositionMove(2, motor2_final_target, STALL_CALIBRATION_BACKOFF_TOLERANCE, true, POSITION_MOVE_SPEED);
+    startPositionMove(1, motor1_final_target, STALL_CALIBRATION_BACKOFF_TOLERANCE, true, POSITION_MOVE_SPEED);
 
     bool motor2_ok =
         waitForMotorHold(2, motor2_final_target, STALL_CALIBRATION_BACKOFF_TOLERANCE);
@@ -1357,25 +1567,45 @@ void calibrateMotors21ToStallAndHold() {
         waitForMotorHold(1, motor1_final_target, STALL_CALIBRATION_BACKOFF_TOLERANCE);
 
     if (!motor2_ok || !motor1_ok) {
-        Serial.println("C2 final hold timed out on motors 2/1");
+        Serial.println("CP final hold timed out on motors 2/1");
+        printCpMotorSnapshot(2, "final paired hold", motor2_final_target, STALL_CALIBRATION_BACKOFF_TOLERANCE);
+        printCpMotorSnapshot(1, "final paired hold", motor1_final_target, STALL_CALIBRATION_BACKOFF_TOLERANCE);
         return;
     }
 
     if (!calibrateLocalMotorToBackoffHold(6, motor6_post50)) {
-        Serial.println("C2 aborted on motor 6");
+        Serial.println("CP aborted on motor 6");
         return;
     }
 
     if (!calibrateLocalMotorToBackoffHold(5, motor5_post50)) {
-        Serial.println("C2 aborted on motor 5");
+        Serial.println("CP aborted on motor 5");
         return;
     }
 
-    int32_t motor6_final_target = motor6_post50 - getC2FinalBackoffCounts(6);
-    int32_t motor5_final_target = motor5_post50 - getC2FinalBackoffCounts(5);
+    int32_t motor6_final_target_raw = motor6_post50 - getCpFinalBackoffCounts(6);
+    int32_t motor5_final_target_raw = motor5_post50 - getCpFinalBackoffCounts(5);
+    int32_t motor6_final_target = clampMotorTargetToLimits(6, motor6_final_target_raw);
+    int32_t motor5_final_target = clampMotorTargetToLimits(5, motor5_final_target_raw);
 
-    startPositionMove(6, motor6_final_target, STALL_CALIBRATION_BACKOFF_TOLERANCE, true);
-    startPositionMove(5, motor5_final_target, STALL_CALIBRATION_BACKOFF_TOLERANCE, true);
+    if (motor6_final_target != motor6_final_target_raw) {
+        Serial.print("CP debug: motor 6 final target clamped from ");
+        Serial.print(motor6_final_target_raw);
+        Serial.print(" to ");
+        Serial.print(motor6_final_target);
+        Serial.println(" due to active travel limits");
+    }
+
+    if (motor5_final_target != motor5_final_target_raw) {
+        Serial.print("CP debug: motor 5 final target clamped from ");
+        Serial.print(motor5_final_target_raw);
+        Serial.print(" to ");
+        Serial.print(motor5_final_target);
+        Serial.println(" due to active travel limits");
+    }
+
+    startPositionMove(6, motor6_final_target, STALL_CALIBRATION_BACKOFF_TOLERANCE, true, POSITION_MOVE_SPEED);
+    startPositionMove(5, motor5_final_target, STALL_CALIBRATION_BACKOFF_TOLERANCE, true, POSITION_MOVE_SPEED);
 
     bool motor6_ok =
         waitForMotorHold(6, motor6_final_target, STALL_CALIBRATION_BACKOFF_TOLERANCE);
@@ -1383,25 +1613,45 @@ void calibrateMotors21ToStallAndHold() {
         waitForMotorHold(5, motor5_final_target, STALL_CALIBRATION_BACKOFF_TOLERANCE);
 
     if (!motor6_ok || !motor5_ok) {
-        Serial.println("C2 final hold timed out on motors 6/5");
+        Serial.println("CP final hold timed out on motors 6/5");
+        printCpMotorSnapshot(6, "final paired hold", motor6_final_target, STALL_CALIBRATION_BACKOFF_TOLERANCE);
+        printCpMotorSnapshot(5, "final paired hold", motor5_final_target, STALL_CALIBRATION_BACKOFF_TOLERANCE);
         return;
     }
 
     if (!calibrateLocalMotorToBackoffHold(4, motor4_post50)) {
-        Serial.println("C2 aborted on motor 4");
+        Serial.println("CP aborted on motor 4");
         return;
     }
 
     if (!calibrateLocalMotorToBackoffHold(3, motor3_post50)) {
-        Serial.println("C2 aborted on motor 3");
+        Serial.println("CP aborted on motor 3");
         return;
     }
 
-    int32_t motor4_final_target = motor4_post50 - getC2FinalBackoffCounts(4);
-    int32_t motor3_final_target = motor3_post50 - getC2FinalBackoffCounts(3);
+    int32_t motor4_final_target_raw = motor4_post50 - getCpFinalBackoffCounts(4);
+    int32_t motor3_final_target_raw = motor3_post50 - getCpFinalBackoffCounts(3);
+    int32_t motor4_final_target = clampMotorTargetToLimits(4, motor4_final_target_raw);
+    int32_t motor3_final_target = clampMotorTargetToLimits(3, motor3_final_target_raw);
 
-    startPositionMove(4, motor4_final_target, STALL_CALIBRATION_BACKOFF_TOLERANCE, true);
-    startPositionMove(3, motor3_final_target, STALL_CALIBRATION_BACKOFF_TOLERANCE, true);
+    if (motor4_final_target != motor4_final_target_raw) {
+        Serial.print("CP debug: motor 4 final target clamped from ");
+        Serial.print(motor4_final_target_raw);
+        Serial.print(" to ");
+        Serial.print(motor4_final_target);
+        Serial.println(" due to active travel limits");
+    }
+
+    if (motor3_final_target != motor3_final_target_raw) {
+        Serial.print("CP debug: motor 3 final target clamped from ");
+        Serial.print(motor3_final_target_raw);
+        Serial.print(" to ");
+        Serial.print(motor3_final_target);
+        Serial.println(" due to active travel limits");
+    }
+
+    startPositionMove(4, motor4_final_target, STALL_CALIBRATION_BACKOFF_TOLERANCE, true, POSITION_MOVE_SPEED);
+    startPositionMove(3, motor3_final_target, STALL_CALIBRATION_BACKOFF_TOLERANCE, true, POSITION_MOVE_SPEED);
 
     bool motor4_ok =
         waitForMotorHold(4, motor4_final_target, STALL_CALIBRATION_BACKOFF_TOLERANCE);
@@ -1409,25 +1659,45 @@ void calibrateMotors21ToStallAndHold() {
         waitForMotorHold(3, motor3_final_target, STALL_CALIBRATION_BACKOFF_TOLERANCE);
 
     if (!motor4_ok || !motor3_ok) {
-        Serial.println("C2 final hold timed out on motors 4/3");
+        Serial.println("CP final hold timed out on motors 4/3");
+        printCpMotorSnapshot(4, "final paired hold", motor4_final_target, STALL_CALIBRATION_BACKOFF_TOLERANCE);
+        printCpMotorSnapshot(3, "final paired hold", motor3_final_target, STALL_CALIBRATION_BACKOFF_TOLERANCE);
         return;
     }
 
     if (!calibrateLocalMotorToBackoffHold(8, motor8_post50)) {
-        Serial.println("C2 aborted on motor 8");
+        Serial.println("CP aborted on motor 8");
         return;
     }
 
     if (!calibrateLocalMotorToBackoffHold(7, motor7_post50)) {
-        Serial.println("C2 aborted on motor 7");
+        Serial.println("CP aborted on motor 7");
         return;
     }
 
-    int32_t motor8_final_target = motor8_post50 - getC2FinalBackoffCounts(8);
-    int32_t motor7_final_target = motor7_post50 - getC2FinalBackoffCounts(7);
+    int32_t motor8_final_target_raw = motor8_post50 - getCpFinalBackoffCounts(8);
+    int32_t motor7_final_target_raw = motor7_post50 - getCpFinalBackoffCounts(7);
+    int32_t motor8_final_target = clampMotorTargetToLimits(8, motor8_final_target_raw);
+    int32_t motor7_final_target = clampMotorTargetToLimits(7, motor7_final_target_raw);
 
-    startPositionMove(8, motor8_final_target, STALL_CALIBRATION_BACKOFF_TOLERANCE, true);
-    startPositionMove(7, motor7_final_target, STALL_CALIBRATION_BACKOFF_TOLERANCE, true);
+    if (motor8_final_target != motor8_final_target_raw) {
+        Serial.print("CP debug: motor 8 final target clamped from ");
+        Serial.print(motor8_final_target_raw);
+        Serial.print(" to ");
+        Serial.print(motor8_final_target);
+        Serial.println(" due to active travel limits");
+    }
+
+    if (motor7_final_target != motor7_final_target_raw) {
+        Serial.print("CP debug: motor 7 final target clamped from ");
+        Serial.print(motor7_final_target_raw);
+        Serial.print(" to ");
+        Serial.print(motor7_final_target);
+        Serial.println(" due to active travel limits");
+    }
+
+    startPositionMove(8, motor8_final_target, STALL_CALIBRATION_BACKOFF_TOLERANCE, true, POSITION_MOVE_SPEED);
+    startPositionMove(7, motor7_final_target, STALL_CALIBRATION_BACKOFF_TOLERANCE, true, POSITION_MOVE_SPEED);
 
     bool motor8_ok =
         waitForMotorHold(8, motor8_final_target, STALL_CALIBRATION_BACKOFF_TOLERANCE);
@@ -1435,23 +1705,26 @@ void calibrateMotors21ToStallAndHold() {
         waitForMotorHold(7, motor7_final_target, STALL_CALIBRATION_BACKOFF_TOLERANCE);
 
     if (!motor8_ok || !motor7_ok) {
-        Serial.println("C2 final hold timed out on motors 8/7");
+        Serial.println("CP final hold timed out on motors 8/7");
+        printCpMotorSnapshot(8, "final paired hold", motor8_final_target, STALL_CALIBRATION_BACKOFF_TOLERANCE);
+        printCpMotorSnapshot(7, "final paired hold", motor7_final_target, STALL_CALIBRATION_BACKOFF_TOLERANCE);
         return;
     }
-    Serial.println("C2 complete");
+    Serial.println("CP complete");
     resetAllEncoderCounts();
 }
 
 void printHelp() {
     Serial.println("Available commands:");
     Serial.println("  h             - Show this help");
-    Serial.println("  cf            - Calibrate encoder direction on motors 1-8 (required after boot)");
-    Serial.println("  c2            - Calibrate pairs 2/1, 6/5, 4/3, 8/7 then zero encoders");
+    Serial.println("  cd            - Calibrate encoder direction on motors 1-8 (required after boot)");
+    Serial.println("  cp            - Calibrate pairs 2/1, 6/5, 4/3, 8/7 then zero encoders");
     Serial.println("  j<id>f        - Jog motor 1-8 forward");
     Serial.println("  j<id>b        - Jog motor 1-8 backward");
     Serial.println("  j<id><f|b>,<counts>,<tol> - Move motor relative by encoder counts");
     Serial.println("  p<id>,<pos>,<tol> - Move motor to encoder position");
     Serial.println("  p<id>,<pos>,<tol>;<id>,<pos>,<tol> - Move multiple motors together");
+    Serial.println("  ms,<speed>    - Set general movement speed for non-cp motion");
     Serial.println("  f<id>,<prox>,<dist>[,<tol>] - Move finger proximal/distal joints together");
     Serial.println("  f...;f...     - Chain multiple finger move commands");
     Serial.println("  fd            - Demo fingers curling and uncurling in order");
@@ -1463,6 +1736,8 @@ void printHelp() {
     Serial.println("  e             - Show encoder counts for motors 1-8");
     Serial.println("  ra            - Reset all encoder counts to 0");
     Serial.println("  mz            - Move all motors to encoder position 0 +/- 5");
+    Serial.print("General movement speed: ");
+    Serial.println(general_move_speed);
 }
 
 void setup() {
@@ -1483,7 +1758,7 @@ void setup() {
     Serial.println("PRIMARY ESP32 - Robot Hand Control");
     Serial.println("====================================");
     Serial.println("UART link: Serial2 RX=4 TX=23");
-    Serial.println("Motion locked until 'cf' is run after boot");
+    Serial.println("Motion locked until 'cd' is run after boot");
     Serial.println("Travel limits stay off until encoders are reset");
     printHelp();
 }
@@ -1505,10 +1780,10 @@ void loop() {
                 (cmd == 'p') ||
                 (cmd == 'f') ||
                 (cmd == 'm' && input.length() > 1 && input[1] == 'z') ||
-                (cmd == 'c' && input.length() > 1 && input[1] == '2');
+                (cmd == 'c' && input.length() > 1 && input[1] == 'p');
 
             if (!motion_commands_enabled && is_motion_command) {
-                Serial.println("Motion locked. Run 'cf' after boot before using motion commands.");
+                Serial.println("Motion locked. Run 'cd' after boot before using motion commands.");
             } else if (cmd == 'j' && input.length() > 2) {
                 JogMoveInput jog_command;
                 if (parseJogCommand(input, jog_command)) {
@@ -1527,6 +1802,16 @@ void loop() {
             } else if (cmd == 'p') {
                 if (!handlePositionCommands(input)) {
                     Serial.println("Use p<id>,<position>,<tolerance> or separate multiple moves with ;");
+                }
+            } else if (cmd == 'm' && input.length() > 2 && input[1] == 's') {
+                int separator_index = input.indexOf(',');
+                if (separator_index > 1) {
+                    int32_t requested_speed = input.substring(separator_index + 1).toInt();
+                    setGeneralMoveSpeed(clampGeneralMoveSpeed(requested_speed));
+                    Serial.print("General movement speed set to ");
+                    Serial.println(general_move_speed);
+                } else {
+                    Serial.println("Use ms,<speed>");
                 }
             } else if (cmd == 'f') {
                 if (input.equalsIgnoreCase("fd")) {
@@ -1570,12 +1855,16 @@ void loop() {
             } else if (cmd == 'm' && input.length() > 1 && input[1] == 'z') {
                 moveAllMotorsToZero();
             } else if (cmd == 'e') {
-                printAllEncoderCounts();
-            } else if (cmd == 'c' && input.length() > 1 && input[1] == 'f') {
+                if (input.equalsIgnoreCase("es")) {
+                    printEncoderSnapshot();
+                } else {
+                    printAllEncoderCounts();
+                }
+            } else if (cmd == 'c' && input.length() > 1 && input[1] == 'd') {
                 calibrateEncoderDirections();
                 motion_commands_enabled = true;
                 Serial.println("Motion unlocked");
-            } else if (cmd == 'c' && input.length() > 1 && input[1] == '2') {
+            } else if (cmd == 'c' && input.length() > 1 && input[1] == 'p') {
                 calibrateMotors21ToStallAndHold();
             } else if (cmd == 'h') {
                 printHelp();

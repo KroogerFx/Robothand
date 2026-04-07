@@ -52,7 +52,7 @@ bool UART_Comm::receiveCommand(MotorCommand& cmd) {
 }
 
 void UART_Comm::sendPositionCommand(const PositionCommand& cmd) {
-    uint8_t packet[11];
+    uint8_t packet[13];
     packet[0] = CMD_MOVE_TO_POSITION;
     packet[1] = cmd.motor_id;
     packet[2] = (cmd.target_position >> 24) & 0xFF;
@@ -63,9 +63,11 @@ void UART_Comm::sendPositionCommand(const PositionCommand& cmd) {
     packet[7] = (cmd.tolerance >> 16) & 0xFF;
     packet[8] = (cmd.tolerance >> 8) & 0xFF;
     packet[9] = cmd.tolerance & 0xFF;
-    packet[10] = calculateChecksum(packet, 10);
+    packet[10] = (cmd.move_speed >> 8) & 0xFF;
+    packet[11] = cmd.move_speed & 0xFF;
+    packet[12] = calculateChecksum(packet, 12);
     
-    uart_port->write(packet, 11);
+    uart_port->write(packet, 13);
 }
 
 bool UART_Comm::receivePositionCommand(PositionCommand& cmd) {
@@ -79,8 +81,8 @@ bool UART_Comm::receivePositionCommand(PositionCommand& cmd) {
         uint8_t byte = uart_port->read();
         rx_buffer[rx_index++] = byte;
         
-        if (rx_index >= 11) {
-            if (verifyChecksum(rx_buffer, 11) &&
+        if (rx_index >= 13) {
+            if (verifyChecksum(rx_buffer, 13) &&
                 rx_buffer[0] == CMD_MOVE_TO_POSITION) {
                 cmd.motor_id = rx_buffer[1];
                 cmd.target_position = ((int32_t)rx_buffer[2] << 24) |
@@ -91,14 +93,16 @@ bool UART_Comm::receivePositionCommand(PositionCommand& cmd) {
                                 ((int32_t)rx_buffer[7] << 16) |
                                 ((int32_t)rx_buffer[8] << 8) |
                                 rx_buffer[9];
+                cmd.move_speed = ((int16_t)rx_buffer[10] << 8) |
+                                 rx_buffer[11];
                 rx_index = 0;
                 return true;
             }
 
-            for (uint8_t i = 1; i < 11; i++) {
+            for (uint8_t i = 1; i < 13; i++) {
                 rx_buffer[i - 1] = rx_buffer[i];
             }
-            rx_index = 10;
+            rx_index = 12;
         }
     }
 
@@ -198,6 +202,7 @@ bool UART_Comm::isValidCommandType(uint8_t type) const {
            type == CMD_STOP_MOTOR ||
            type == CMD_MOVE_TO_POSITION ||
            type == CMD_CALIBRATE_ENCODER_DIRECTION ||
+           type == CMD_SET_POSITION_MOVE_SPEED ||
            type == CMD_RUN_UNTIL_STALL ||
            type == CMD_RESET_ENCODER ||
            type == CMD_ACK;
@@ -208,6 +213,7 @@ bool UART_Comm::isShortCommandType(uint8_t type) const {
            type == CMD_GET_ENCODER_DATA ||
            type == CMD_STOP_MOTOR ||
            type == CMD_CALIBRATE_ENCODER_DIRECTION ||
+           type == CMD_SET_POSITION_MOVE_SPEED ||
            type == CMD_RUN_UNTIL_STALL ||
            type == CMD_RESET_ENCODER ||
            type == CMD_ACK;

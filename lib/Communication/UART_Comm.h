@@ -28,6 +28,7 @@ public:
         CMD_MOVE_TO_POSITION = 0x05,
         CMD_CALIBRATE_ENCODER_DIRECTION = 0x06,
         CMD_RUN_UNTIL_STALL = 0x07,
+        CMD_SET_POSITION_MOVE_SPEED = 0x08,
         RESP_ENCODER_DATA = 0x81,
         CMD_ACK = 0xFF
     };
@@ -48,6 +49,7 @@ public:
         uint8_t motor_id;
         int32_t target_position;
         int32_t tolerance;
+        int16_t move_speed;
     };
 
     UART_Comm(uint8_t rx_pin, uint8_t tx_pin, uint32_t baud_rate, 

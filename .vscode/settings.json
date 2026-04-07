@@ -1,0 +1,4 @@
+{
+    "python.defaultInterpreterPath": "${env:USERPROFILE}\\.platformio\\penv\\Scripts\\python.exe",
+    "python.terminal.activateEnvironment": true
+}
