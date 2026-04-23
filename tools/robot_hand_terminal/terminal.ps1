@@ -167,7 +167,7 @@ function Start-CliTerminal {
         Write-Prompt $inputBuffer.ToString()
     }
 
-    function Poll-SerialInput {
+    function Receive-SerialInput {
         if (-not $script:serialPort -or -not $script:serialPort.IsOpen) {
             return
         }
@@ -268,14 +268,14 @@ function Start-CliTerminal {
         }
     }
 
-    function Handle-LocalCommand([string]$CommandLine) {
+    function Invoke-LocalCommand([string]$CommandLine) {
         $parts = @($CommandLine -split '\s+' | Where-Object { $_ -ne "" })
         if ($parts.Count -eq 0) {
             return $true
         }
 
         $command = $parts[0].ToLowerInvariant()
-        $args = if ($parts.Count -gt 1) { $parts[1..($parts.Count - 1)] } else { @() }
+        $commandArgs = if ($parts.Count -gt 1) { $parts[1..($parts.Count - 1)] } else { @() }
 
         switch ($command) {
             "help" {
@@ -287,11 +287,11 @@ function Start-CliTerminal {
                 return $true
             }
             "open" {
-                if ($args.Count -gt 0) {
+                if ($commandArgs.Count -gt 0) {
                     $ports = @(Get-Ports)
-                    $resolved = Resolve-PortChoice $args[0] $ports
+                    $resolved = Resolve-PortChoice $commandArgs[0] $ports
                     if (-not $resolved) {
-                        Write-Host "Could not match port selection: $($args[0])"
+                        Write-Host "Could not match port selection: $($commandArgs[0])"
                         return $true
                     }
                     Open-Port $resolved
@@ -306,18 +306,18 @@ function Start-CliTerminal {
                 return $true
             }
             "baud" {
-                if ($args.Count -eq 0) {
+                if ($commandArgs.Count -eq 0) {
                     Write-Host "Current baud rate: $script:baudRate"
                 } else {
-                    Set-BaudRate $args[0]
+                    Set-BaudRate $commandArgs[0]
                 }
                 return $true
             }
             "ending" {
-                if ($args.Count -eq 0) {
+                if ($commandArgs.Count -eq 0) {
                     Write-Host "Current line ending: $script:lineEnding"
                 } else {
-                    Set-LineEnding $args[0]
+                    Set-LineEnding $commandArgs[0]
                 }
                 return $true
             }
@@ -346,7 +346,7 @@ function Start-CliTerminal {
     try {
         Write-Prompt
         while ($true) {
-            Poll-SerialInput
+            Receive-SerialInput
 
             if ([Console]::KeyAvailable) {
                 $key = [Console]::ReadKey($true)
@@ -363,7 +363,7 @@ function Start-CliTerminal {
                         }
 
                         if ($userInput.StartsWith(":")) {
-                            if (-not (Handle-LocalCommand $userInput.Substring(1))) {
+                            if (-not (Invoke-LocalCommand $userInput.Substring(1))) {
                                 break
                             }
                             Write-Prompt
@@ -621,7 +621,7 @@ function Start-GuiTerminal {
         $script:RobotHandGui.StatusLabel.Text = $Message
     }
 
-    function Append-BoxLog($TargetBox, [string]$Tag, [string]$Message) {
+    function Write-BoxLog($TargetBox, [string]$Tag, [string]$Message) {
         $timestamp = Get-Date -Format "HH:mm:ss"
         $TargetBox.AppendText(("[{0}] [{1}] {2}" -f $timestamp, $Tag, $Message))
         if (-not $Message.EndsWith("`n")) {
@@ -631,16 +631,16 @@ function Start-GuiTerminal {
         $TargetBox.ScrollToCaret()
     }
 
-    function Append-RxLog([string]$Tag, [string]$Message) {
-        Append-BoxLog $rxLogBox $Tag $Message
+    function Write-RxLog([string]$Tag, [string]$Message) {
+        Write-BoxLog $rxLogBox $Tag $Message
     }
 
-    function Append-TxLog([string]$Tag, [string]$Message) {
-        Append-BoxLog $txLogBox $Tag $Message
+    function Write-TxLog([string]$Tag, [string]$Message) {
+        Write-BoxLog $txLogBox $Tag $Message
     }
 
-    function Append-SystemLog([string]$Message) {
-        Append-TxLog "SYS" $Message
+    function Write-SystemLog([string]$Message) {
+        Write-TxLog "SYS" $Message
     }
 
     function New-CommandButton([string]$Label, [string]$CommandText, [int]$Width = 96) {
@@ -703,7 +703,7 @@ function Start-GuiTerminal {
         Set-Status "Disconnected"
     }
 
-    function Refresh-Ports {
+    function Update-Ports {
         $currentPort = if ($state.SerialPort -and $state.SerialPort.IsOpen) { $state.SerialPort.PortName } else { $Port }
         $ports = @(Get-Ports)
         $portCombo.Items.Clear()
@@ -756,14 +756,14 @@ function Start-GuiTerminal {
     function Connect-Port {
         $portName = Get-SelectedPort
         if (-not $portName) {
-            Append-SystemLog "Select a serial port first."
+            Write-SystemLog "Select a serial port first."
             Set-Status "No port selected"
             return
         }
 
         $parsedBaud = 0
         if (-not [int]::TryParse($baudCombo.Text, [ref]$parsedBaud)) {
-            Append-SystemLog ("Invalid baud rate: {0}" -f $baudCombo.Text)
+            Write-SystemLog ("Invalid baud rate: {0}" -f $baudCombo.Text)
             Set-Status "Invalid baud rate"
             return
         }
@@ -790,10 +790,10 @@ function Start-GuiTerminal {
                     try {
                         $text = $state.SerialPort.ReadExisting()
                         if (-not [string]::IsNullOrEmpty($text)) {
-                            Append-RxLog "RX" $text
+                            Write-RxLog "RX" $text
                         }
                     } catch {
-                        Append-SystemLog ("Serial read stopped: {0}" -f $_.Exception.Message)
+                        Write-SystemLog ("Serial read stopped: {0}" -f $_.Exception.Message)
                         Disconnect-Port
                     }
                 }.GetNewClosure())
@@ -802,11 +802,11 @@ function Start-GuiTerminal {
             $state.PollTimer.Start()
 
             $connectButton.Text = "Disconnect"
-            Append-SystemLog ("Connected to {0} at {1} baud" -f $portName, $parsedBaud)
+            Write-SystemLog ("Connected to {0} at {1} baud" -f $portName, $parsedBaud)
             Set-Status ("Connected to {0}" -f $portName)
             $inputBox.Focus()
         } catch {
-            Append-SystemLog ("Failed to open {0}: {1}" -f $portName, $_.Exception.Message)
+            Write-SystemLog ("Failed to open {0}: {1}" -f $portName, $_.Exception.Message)
             Set-Status ("Failed to open {0}" -f $portName)
         }
     }
@@ -818,7 +818,7 @@ function Start-GuiTerminal {
         }
 
         if (-not $state.SerialPort -or -not $state.SerialPort.IsOpen) {
-            Append-SystemLog "No serial port is open."
+            Write-SystemLog "No serial port is open."
             Set-Status "No serial port is open"
             return
         }
@@ -826,12 +826,12 @@ function Start-GuiTerminal {
         try {
             $payload = $text + $script:lineEndingMap[[string]$endingCombo.SelectedItem]
             $state.SerialPort.Write($payload)
-            Append-TxLog "TX" $text
+            Write-TxLog "TX" $text
             if (-not $PreserveInput) {
                 $inputBox.Clear()
             }
         } catch {
-            Append-SystemLog ("Send failed: {0}" -f $_.Exception.Message)
+            Write-SystemLog ("Send failed: {0}" -f $_.Exception.Message)
             Disconnect-Port
         }
     }
